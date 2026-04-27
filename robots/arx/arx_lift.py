@@ -205,47 +205,64 @@ class ARXLift(Robot):
         return ft
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
-        """Send action commands to robot via ROS2 Bridge."""
+        """Send action commands to robot via ROS2 Bridge.
+
+        Supports two action formats (auto-detected from action keys):
+        - Joint position control: keys like ``left_joint_1.pos``  (pick_handover)
+        - Delta EE pose control:  keys like ``left_delta_ee_pose.x`` (fold_cloth)
+        """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         _t0 = time.perf_counter()
         if not self.cfg.debug:
-            # Send arm joint positions via Bridge
-            left_pos = np.array([action[f"left_joint_{i+1}.pos"] for i in range(self._num_joints)])
-            right_pos = np.array([action[f"right_joint_{i+1}.pos"] for i in range(self._num_joints)])
+            if "left_joint_1.pos" in action:
+                # ── 关节角模式 (pick_handover) ──────────────────────────────
+                left_pos = np.array([action[f"left_joint_{i+1}.pos"] for i in range(self._num_joints)])
+                right_pos = np.array([action[f"right_joint_{i+1}.pos"] for i in range(self._num_joints)])
 
-            # Update gripper state tracking
-            # gripper_position 是归一化值 (-0.2~0.2), 需要 * 5.0 转为 SDK 原始值
-            if "left_gripper_position" in action:
-                self._left_gripper_position = action["left_gripper_position"]
-                left_pos[6] = self._left_gripper_position * 5.0
-            if "right_gripper_position" in action:
-                self._right_gripper_position = action["right_gripper_position"]
-                right_pos[6] = self._right_gripper_position * 5.0
+                # gripper_position 是归一化值 (-0.2~0.2), 需要 * 5.0 转为 SDK 原始值
+                if "left_gripper_position" in action:
+                    self._left_gripper_position = action["left_gripper_position"]
+                    left_pos[6] = self._left_gripper_position * 5.0
+                if "right_gripper_position" in action:
+                    self._right_gripper_position = action["right_gripper_position"]
+                    right_pos[6] = self._right_gripper_position * 5.0
 
-            # Chassis commands (zeroed when LIFT is disabled)
-            if self.cfg.enable_lift:
-                vx = action.get("chassis_vx", 0.0)
-                vy = action.get("chassis_vy", 0.0)
-                wz = action.get("chassis_wz", 0.0)
-                height = action.get("chassis_height", 0.0)
-            else:
                 vx = vy = wz = height = 0.0
+                if self.cfg.enable_lift:
+                    vx = action.get("chassis_vx", 0.0)
+                    vy = action.get("chassis_vy", 0.0)
+                    wz = action.get("chassis_wz", 0.0)
+                    height = action.get("chassis_height", 0.0)
 
-            # Send all commands in a single RPC call
-            self.bridge.set_full_command(left_pos, right_pos, vx, vy, wz, height)
+                self.bridge.set_full_command(left_pos, right_pos, vx, vy, wz, height)
+
+            elif "left_delta_ee_pose.x" in action:
+                # ── Delta EE 位姿模式 (fold_cloth) ──────────────────────────
+                # 数据集 action key 轴名: x/y/z/rx/ry/rz (rx=roll, ry=pitch, rz=yaw)
+                _AXES = ["x", "y", "z", "rx", "ry", "rz"]
+                left_delta  = np.array([action[f"left_delta_ee_pose.{ax}"]  for ax in _AXES])
+                right_delta = np.array([action[f"right_delta_ee_pose.{ax}"] for ax in _AXES])
+
+                # 从上一帧缓存的状态里读当前末端位姿 [x, y, z, roll, pitch, yaw]
+                # infer.py 每步都先调 get_observation()，所以 _last_state 是最新的
+                left_ee  = np.asarray(self._last_state["left_arm"]["end_pose"],  dtype=np.float64)
+                right_ee = np.asarray(self._last_state["right_arm"]["end_pose"], dtype=np.float64)
+
+                new_left  = (left_ee  + left_delta).tolist()
+                new_right = (right_ee + right_delta).tolist()
+
+                # 二值夹爪指令 (0.0=开, 1.0=关)
+                left_gripper  = float(action.get("left_gripper_cmd_bin",  0.0))
+                right_gripper = float(action.get("right_gripper_cmd_bin", 0.0))
+
+                self.bridge.set_dual_ee_poses(new_left, new_right, left_gripper, right_gripper)
+
+            else:
+                logger.warning("send_action: 未知 action 格式，忽略。keys=%s", list(action.keys())[:4])
+
         _t_send = time.perf_counter() - _t0
-
-        # Note: action delta_tcp_pose is computed in teleop get_action()
-        # so it's already in the action dict that gets saved to dataset.
-
-        # Report full main-loop timing (obs + send combined)
-        self._perf.record(
-            get_state=getattr(self, '_perf_obs_rpc', 0.0),
-            cameras=getattr(self, '_perf_obs_cam', 0.0),
-            send_cmd=_t_send,
-        )
 
         return action
 
@@ -414,17 +431,18 @@ class ARXLift(Robot):
                        steps: int = 50, delay_sec: float = 0.05) -> None:
         """Smoothly interpolate arms from current pose to the joint state in ``target_action``.
 
-        Mirrors ``go_home`` but the target comes from a LeRobot action dict (typically
-        the first frame of an episode), so replay starts without a sudden jump from
-        whatever pose the arms happen to be in.
+        For joint position actions (pick_handover): interpolates from current joint
+        positions to the target joint positions over ``steps`` steps.
 
-        Args:
-            target_action: Action dict with keys ``{side}_joint_{1..7}.pos`` and
-                optional ``{side}_gripper_position`` (normalized, -0.2..0.2).
-            steps: Number of interpolation steps (more = slower/smoother).
-            delay_sec: Delay between each step; total time ≈ steps * delay_sec.
+        For delta EE pose actions (fold_cloth): delta has no absolute target, so
+        this method skips interpolation and returns immediately.
         """
         if self.bridge is None or not self.is_connected:
+            return
+
+        # delta EE pose 没有绝对目标位姿，无法插值，直接跳过
+        if "left_joint_1.pos" not in target_action:
+            logger.info("[move_to_action] delta EE pose 模式，跳过平滑过渡，从当前位姿直接开始推理")
             return
 
         # Current joint positions from robot (7 joints per arm, last is SDK-scale gripper)
