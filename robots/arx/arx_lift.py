@@ -1,0 +1,505 @@
+import logging
+import os
+import time
+from typing import Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import numpy as np
+import sys
+
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from ros2_bridge.arx_ros2_rpc_client import ArxROS2RPCClient
+
+from lerobot.cameras import make_cameras_from_configs
+from lerobot.utils.errors import DeviceNotConnectedError, DeviceAlreadyConnectedError
+from lerobot.robots.robot import Robot
+from .config_arx import ARXConfig
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+_EE_AXES = ["x", "y", "z", "roll", "pitch", "yaw"]
+
+
+def _angle_diff(a: float, b: float) -> float:
+    """Compute shortest angular difference (a - b), handling ±π wrapping."""
+    d = a - b
+    return (d + np.pi) % (2 * np.pi) - np.pi
+
+
+class _PerfStats:
+    """Lightweight rolling performance stats for periodic logging."""
+    def __init__(self, name: str, report_every: int = 100):
+        self.name = name
+        self.report_every = report_every
+        self._count = 0
+        self._sums = {}
+        self._maxs = {}
+
+    def record(self, **kwargs):
+        self._count += 1
+        for k, v in kwargs.items():
+            self._sums[k] = self._sums.get(k, 0.0) + v
+            self._maxs[k] = max(self._maxs.get(k, 0.0), v)
+        if self._count % self.report_every == 0:
+            parts = []
+            for k in kwargs:
+                avg = self._sums[k] / self.report_every * 1000
+                mx = self._maxs[k] * 1000
+                parts.append(f"{k}={avg:.1f}/{mx:.1f}ms")
+            logger.info(f"[PERF {self.name}] {self._count} frames | " + " | ".join(parts))
+            self._sums.clear()
+            self._maxs.clear()
+
+
+class ARXLift(Robot):
+    """
+    ARX LIFT robot class using ROS2 Bridge for hardware abstraction.
+    Extends LeRobot's Robot base class.
+
+    R5/X5lite arms have 6 arm joints + 1 gripper (7 total from SDK).
+    Connected via ROS2 Bridge which manages CAN bus communication.
+    LIFT chassis connected via can5.
+
+    Joint structure per arm:
+        - Joints 1-6: Arm joints (URDF: joint1-joint6)
+        - Joint 7: Gripper position (from SDK, separate control via set_catch_pos)
+
+    Architecture:
+        - Uses ARXLift2Bridge for all hardware communication
+        - Bridge handles ROS2 message processing in background threads
+        - No direct CAN or SDK calls - all abstracted through Bridge
+    """
+
+    config_class = ARXConfig
+    name = "arx_lift"
+
+    def __init__(self, config: ARXConfig):
+        super().__init__(config)
+        self.cameras = make_cameras_from_configs(config.cameras)
+
+        self.cfg = config
+        self._is_connected = False
+        self._num_joints = config.num_joints
+
+        # ROS2 Bridge - replaces direct BimanualArm and LiftHeadControlLoop
+        # Will be initialized in connect()
+        self.bridge = None
+
+        # Gripper state tracking (Bridge reads actual position from SDK joint 7)
+        self._left_gripper_position = config.gripper_open
+        self._right_gripper_position = config.gripper_open
+
+        # Cached state for avoiding redundant RPC calls within same frame
+        self._last_state = None
+
+        # Previous ee_pose tracking for observation delta computation
+        self._prev_obs_left_ee = np.zeros(6)
+        self._prev_obs_right_ee = np.zeros(6)
+        self._obs_initialized = False
+
+        # Performance monitoring
+        self._perf = _PerfStats("main_loop", report_every=100)
+
+    def connect(self) -> None:
+        if self.is_connected:
+            raise DeviceAlreadyConnectedError(f"{self.name} is already connected.")
+
+        rpc_host = os.environ.get("ARX_RPC_HOST", "localhost")
+        rpc_port = int(os.environ.get("ARX_RPC_PORT", "4242"))
+        logger.info(
+            "\n===== [ROBOT] Initializing ARX LIFT2 System via RPC (tcp://%s:%s) =====",
+            rpc_host,
+            rpc_port,
+        )
+
+        try:
+            # ZMQ RPC client (local or remote control PC via ARX_RPC_HOST / ARX_RPC_PORT)
+            self.bridge = ArxROS2RPCClient(ip=rpc_host, port=rpc_port)
+
+            # Connect to server
+            if not self.bridge.system_connect(timeout=10.0):
+                raise Exception("Failed to connect to ZeroRPC server")
+
+            # Display current state
+            left_pos = self.bridge.get_left_joint_positions()
+            right_pos = self.bridge.get_right_joint_positions()
+
+            logger.info(f"[ROBOT] Left R5 arm joint positions ({len(left_pos)} joints): {[round(p, 4) for p in left_pos]}")
+            logger.info(f"[ROBOT] Right R5 arm joint positions ({len(right_pos)} joints): {[round(p, 4) for p in right_pos]}")
+            if self.cfg.enable_lift:
+                chassis_height = self.bridge.get_chassis_height()
+                logger.info(f"[CHASSIS] Current height: {chassis_height:.4f} m")
+            else:
+                logger.info("[CHASSIS] LIFT disabled - running arms-only mode")
+            logger.info("===== [ROBOT] System connected successfully =====\n")
+
+        except Exception as e:
+            logger.error(f"===== [ERROR] Failed to connect to ARX LIFT2 system: {e} =====")
+            raise
+
+        # Connect cameras
+        logger.info("\n===== [CAM] Initializing Cameras =====")
+        for cam_name, cam in self.cameras.items():
+            cam.connect()
+            logger.info(f"[CAM] {cam_name} connected successfully.")
+        logger.info("===== [CAM] Cameras Initialized Successfully =====\n")
+
+        self.is_connected = True
+        logger.info(f"[INFO] {self.name} env initialization completed successfully.\n")
+
+    @property
+    def _motors_ft(self) -> dict[str, type]:
+        """Motor state features for observation. R5 has 6 arm joints + 1 gripper per arm."""
+        ft = {
+            # Left arm joints (position, velocity, current) - 6 arm joints + 1 gripper
+            **{f"left_joint_{i+1}.pos": float for i in range(self._num_joints)},
+            **{f"left_joint_{i+1}.vel": float for i in range(self._num_joints)},
+            **{f"left_joint_{i+1}.cur": float for i in range(self._num_joints)},
+            # Right arm joints - 6 arm joints + 1 gripper
+            **{f"right_joint_{i+1}.pos": float for i in range(self._num_joints)},
+            **{f"right_joint_{i+1}.vel": float for i in range(self._num_joints)},
+            **{f"right_joint_{i+1}.cur": float for i in range(self._num_joints)},
+            # TCP poses (from SDK get_ee_pose) - RPY format [x,y,z,roll,pitch,yaw]
+            **{f"left_tcp_pose.{axis}": float for axis in _EE_AXES},
+            **{f"right_tcp_pose.{axis}": float for axis in _EE_AXES},
+            # Delta TCP poses (frame-to-frame change in ee_pose)
+            **{f"left_delta_tcp_pose.{axis}": float for axis in _EE_AXES},
+            **{f"right_delta_tcp_pose.{axis}": float for axis in _EE_AXES},
+            # Gripper state
+            "left_gripper_position": float,
+            "right_gripper_position": float,
+        }
+        if self.cfg.enable_lift:
+            ft.update({
+                "chassis_height": float,
+                "chassis_head_yaw": float,
+                "chassis_head_pitch": float,
+            })
+        return ft
+
+    @property
+    def action_features(self) -> dict[str, type]:
+        """Action features for control. R5 has 6 arm joints + 1 gripper per arm."""
+        ft = {
+            # Joint position commands - 6 arm joints + 1 gripper
+            **{f"left_joint_{i+1}.pos": float for i in range(self._num_joints)},
+            **{f"right_joint_{i+1}.pos": float for i in range(self._num_joints)},
+            # EE pose targets (commanded target from Placo IK) - RPY format [x,y,z,roll,pitch,yaw]
+            **{f"left_tcp_pose.{axis}": float for axis in _EE_AXES},
+            **{f"right_tcp_pose.{axis}": float for axis in _EE_AXES},
+            # Delta EE pose targets (frame-to-frame change in target ee_pose)
+            **{f"left_delta_tcp_pose.{axis}": float for axis in _EE_AXES},
+            **{f"right_delta_tcp_pose.{axis}": float for axis in _EE_AXES},
+            # Gripper commands
+            "left_gripper_position": float,
+            "right_gripper_position": float,
+        }
+        if self.cfg.enable_lift:
+            ft.update({
+                "chassis_vx": float,
+                "chassis_vy": float,
+                "chassis_wz": float,
+                "chassis_height": float,
+            })
+        return ft
+
+    def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        """Send action commands to robot via ROS2 Bridge."""
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        _t0 = time.perf_counter()
+        if not self.cfg.debug:
+            # Send arm joint positions via Bridge
+            left_pos = np.array([action[f"left_joint_{i+1}.pos"] for i in range(self._num_joints)])
+            right_pos = np.array([action[f"right_joint_{i+1}.pos"] for i in range(self._num_joints)])
+
+            # Update gripper state tracking
+            # gripper_position 是归一化值 (-0.2~0.2), 需要 * 5.0 转为 SDK 原始值
+            if "left_gripper_position" in action:
+                self._left_gripper_position = action["left_gripper_position"]
+                left_pos[6] = self._left_gripper_position * 5.0
+            if "right_gripper_position" in action:
+                self._right_gripper_position = action["right_gripper_position"]
+                right_pos[6] = self._right_gripper_position * 5.0
+
+            # Chassis commands (zeroed when LIFT is disabled)
+            if self.cfg.enable_lift:
+                vx = action.get("chassis_vx", 0.0)
+                vy = action.get("chassis_vy", 0.0)
+                wz = action.get("chassis_wz", 0.0)
+                height = action.get("chassis_height", 0.0)
+            else:
+                vx = vy = wz = height = 0.0
+
+            # Send all commands in a single RPC call
+            self.bridge.set_full_command(left_pos, right_pos, vx, vy, wz, height)
+        _t_send = time.perf_counter() - _t0
+
+        # Note: action delta_tcp_pose is computed in teleop get_action()
+        # so it's already in the action dict that gets saved to dataset.
+
+        # Report full main-loop timing (obs + send combined)
+        self._perf.record(
+            get_state=getattr(self, '_perf_obs_rpc', 0.0),
+            cameras=getattr(self, '_perf_obs_cam', 0.0),
+            send_cmd=_t_send,
+        )
+
+        return action
+
+    def get_observation(self) -> dict[str, Any]:
+        """Get current observation from robot via ROS2 Bridge."""
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        _t0 = time.perf_counter()
+        obs_dict = {}
+
+        # Read full state from Bridge (also cached for teleop reuse)
+        state = self.bridge.get_full_state()
+        self._last_state = state
+        _t_rpc = time.perf_counter()
+
+        # Extract arm joint states
+        left_pos = state["left_arm"]["joint_positions"]
+        right_pos = state["right_arm"]["joint_positions"]
+        left_vel = state["left_arm"]["joint_velocities"]
+        right_vel = state["right_arm"]["joint_velocities"]
+        left_cur = state["left_arm"]["joint_currents"]
+        right_cur = state["right_arm"]["joint_currents"]
+
+        for i in range(self._num_joints):
+            obs_dict[f"left_joint_{i+1}.pos"] = float(left_pos[i])
+            obs_dict[f"left_joint_{i+1}.vel"] = float(left_vel[i])
+            obs_dict[f"left_joint_{i+1}.cur"] = float(left_cur[i])
+            obs_dict[f"right_joint_{i+1}.pos"] = float(right_pos[i])
+            obs_dict[f"right_joint_{i+1}.vel"] = float(right_vel[i])
+            obs_dict[f"right_joint_{i+1}.cur"] = float(right_cur[i])
+
+        # Read TCP poses (Bridge returns [x,y,z,roll,pitch,yaw])
+        left_ee = np.asarray(state["left_arm"]["end_pose"], dtype=np.float64)
+        right_ee = np.asarray(state["right_arm"]["end_pose"], dtype=np.float64)
+
+        for i, axis in enumerate(_EE_AXES):
+            obs_dict[f"left_tcp_pose.{axis}"] = float(left_ee[i])
+            obs_dict[f"right_tcp_pose.{axis}"] = float(right_ee[i])
+
+        # Compute delta ee_pose (frame-to-frame change)
+        if not self._obs_initialized:
+            # First frame: delta is zero
+            delta_left = np.zeros(6)
+            delta_right = np.zeros(6)
+            self._obs_initialized = True
+        else:
+            delta_left = left_ee - self._prev_obs_left_ee
+            delta_right = right_ee - self._prev_obs_right_ee
+            # Handle angle wrapping for roll/pitch/yaw (indices 3,4,5)
+            for j in range(3, 6):
+                delta_left[j] = _angle_diff(left_ee[j], self._prev_obs_left_ee[j])
+                delta_right[j] = _angle_diff(right_ee[j], self._prev_obs_right_ee[j])
+
+        self._prev_obs_left_ee = left_ee.copy()
+        self._prev_obs_right_ee = right_ee.copy()
+
+        for i, axis in enumerate(_EE_AXES):
+            obs_dict[f"left_delta_tcp_pose.{axis}"] = float(delta_left[i])
+            obs_dict[f"right_delta_tcp_pose.{axis}"] = float(delta_right[i])
+
+        # Gripper state (from Bridge - reads joint 7)
+        obs_dict["left_gripper_position"] = float(state["left_arm"]["gripper"])
+        obs_dict["right_gripper_position"] = float(state["right_arm"]["gripper"])
+
+        # Chassis state (only when LIFT is enabled)
+        if self.cfg.enable_lift:
+            obs_dict["chassis_height"] = float(state["chassis"]["height"])
+            obs_dict["chassis_head_yaw"] = float(state["chassis"]["head_yaw"])
+            obs_dict["chassis_head_pitch"] = float(state["chassis"]["head_pitch"])
+
+        # Capture images from cameras (parallel to reduce latency)
+        _t_cam_start = time.perf_counter()
+        if self.cameras:
+            with ThreadPoolExecutor(max_workers=len(self.cameras)) as pool:
+                futures = {pool.submit(cam.read): key for key, cam in self.cameras.items()}
+                for future in as_completed(futures):
+                    obs_dict[futures[future]] = future.result()
+        _t_cam = time.perf_counter()
+
+        # Record observation timing (will be combined with send_action in perf report)
+        self._perf_obs_rpc = _t_rpc - _t0
+        self._perf_obs_cam = _t_cam - _t_cam_start
+
+        return obs_dict
+
+    def disconnect(self) -> None:
+        """Disconnect from robot."""
+        if not self.is_connected:
+            return
+
+        # Stop robot movement via Bridge
+        if self.bridge is not None:
+            logger.info("Stopping robot movement...")
+            try:
+                if self.cfg.enable_lift:
+                    self.bridge.set_chassis_velocity(0.0, 0.0, 0.0)
+                # Hold arms at current position
+                left_pos = self.bridge.get_left_joint_positions()
+                right_pos = self.bridge.get_right_joint_positions()
+                self.bridge.set_dual_joint_positions(left_pos, right_pos)
+                time.sleep(0.2)
+            except Exception as e:
+                logger.warning(f"Error stopping robot: {e}")
+
+            # Disconnect Bridge
+            self.bridge.disconnect()
+            self.bridge = None
+
+        # Disconnect cameras
+        for cam in self.cameras.values():
+            cam.disconnect()
+
+        self.is_connected = False
+        logger.info(f"[INFO] ===== All {self.name} connections have been closed =====")
+
+    def calibrate(self) -> None:
+        """Calibrate robot (not implemented)."""
+        pass
+
+    def is_calibrated(self) -> bool:
+        """Check if robot is calibrated."""
+        return self.is_connected
+
+    def configure(self) -> None:
+        """Configure robot (not implemented)."""
+        pass
+
+    def go_home(self, steps: int = 50, delay_sec: float = 0.05) -> None:
+        """Move arms to home position with smooth linear interpolation.
+
+        Args:
+            steps: Number of interpolation steps (more = slower/smoother)
+            delay_sec: Delay between each step in seconds, total time ≈ steps * delay_sec
+        """
+        if self.bridge is not None and self.is_connected:
+            # Get current joint positions from robot
+            left_current = np.array(self.bridge.get_left_joint_positions())
+            right_current = np.array(self.bridge.get_right_joint_positions())
+
+            # Target home positions from config
+            left_target = np.array(self.cfg.left_init_joints)
+            right_target = np.array(self.cfg.right_init_joints)
+
+            logger.info(f"[go_home] Smooth interpolation: {steps} steps, total {steps * delay_sec:.1f}s")
+            logger.info(f"[go_home] Left current → target: {[round(x, 4) for x in left_current]} → {[round(x, 4) for x in left_target]}")
+            logger.info(f"[go_home] Right current → target: {[round(x, 4) for x in right_current]} → {[round(x, 4) for x in right_target]}")
+
+            # Linear interpolation from current to target
+            for step in range(1, steps + 1):
+                alpha = step / steps  # interpolation factor 0 → 1
+                left_interp = left_current * (1 - alpha) + left_target * alpha
+                right_interp = right_current * (1 - alpha) + right_target * alpha
+
+                # Send interpolated joint positions
+                self.bridge.set_dual_joint_positions(left_interp, right_interp)
+
+                # Wait before next step
+                time.sleep(delay_sec)
+
+            # Final step - ensure we reach exact target
+            self.bridge.set_dual_joint_positions(left_target, right_target)
+            logger.info("[go_home] Done - arms reached home position")
+
+    def move_to_action(self, target_action: dict[str, Any],
+                       steps: int = 50, delay_sec: float = 0.05) -> None:
+        """Smoothly interpolate arms from current pose to the joint state in ``target_action``.
+
+        Mirrors ``go_home`` but the target comes from a LeRobot action dict (typically
+        the first frame of an episode), so replay starts without a sudden jump from
+        whatever pose the arms happen to be in.
+
+        Args:
+            target_action: Action dict with keys ``{side}_joint_{1..7}.pos`` and
+                optional ``{side}_gripper_position`` (normalized, -0.2..0.2).
+            steps: Number of interpolation steps (more = slower/smoother).
+            delay_sec: Delay between each step; total time ≈ steps * delay_sec.
+        """
+        if self.bridge is None or not self.is_connected:
+            return
+
+        # Current joint positions from robot (7 joints per arm, last is SDK-scale gripper)
+        left_current = np.array(self.bridge.get_left_joint_positions())
+        right_current = np.array(self.bridge.get_right_joint_positions())
+
+        # Target joints from action dict. Joint 7 in the dict may be stale/raw; the
+        # normalized gripper_position is the authoritative source - recompute joint 7
+        # as gripper_position * 5.0 to match send_action's scaling convention.
+        left_target = np.array([target_action[f"left_joint_{i+1}.pos"] for i in range(self._num_joints)])
+        right_target = np.array([target_action[f"right_joint_{i+1}.pos"] for i in range(self._num_joints)])
+        if "left_gripper_position" in target_action:
+            left_target[6] = target_action["left_gripper_position"] * 5.0
+        if "right_gripper_position" in target_action:
+            right_target[6] = target_action["right_gripper_position"] * 5.0
+
+        logger.info(f"[move_to_action] Smooth interpolation: {steps} steps, total {steps * delay_sec:.1f}s")
+        logger.info(f"[move_to_action] Left current → target: {[round(x, 4) for x in left_current]} → {[round(x, 4) for x in left_target]}")
+        logger.info(f"[move_to_action] Right current → target: {[round(x, 4) for x in right_current]} → {[round(x, 4) for x in right_target]}")
+
+        # Linear interpolation from current to target
+        for step in range(1, steps + 1):
+            alpha = step / steps                                                # 0 → 1
+            left_interp = left_current * (1 - alpha) + left_target * alpha
+            right_interp = right_current * (1 - alpha) + right_target * alpha
+            self.bridge.set_dual_joint_positions(left_interp, right_interp)
+            time.sleep(delay_sec)
+
+        # Final step - ensure we reach exact target
+        self.bridge.set_dual_joint_positions(left_target, right_target)
+
+        # Sync internal gripper tracker so the upcoming send_action's override uses the right value
+        if "left_gripper_position" in target_action:
+            self._left_gripper_position = target_action["left_gripper_position"]
+        if "right_gripper_position" in target_action:
+            self._right_gripper_position = target_action["right_gripper_position"]
+
+        logger.info("[move_to_action] Done - arms at first-frame pose")
+
+    def gravity_compensation(self) -> None:
+        """
+        Enable gravity compensation mode.
+        Note: Not directly supported in ROS2 Bridge API.
+        Would need to be implemented in the underlying controller nodes.
+        """
+        logger.warning("Gravity compensation not implemented in ROS2 Bridge interface")
+
+    @property
+    def is_connected(self) -> bool:
+        return self._is_connected
+
+    @is_connected.setter
+    def is_connected(self, value: bool) -> None:
+        self._is_connected = value
+
+    @property
+    def _cameras_ft(self) -> dict[str, tuple]:
+        return {cam: (self.cameras[cam].height, self.cameras[cam].width, 3) for cam in self.cameras}
+
+    @property
+    def observation_features(self) -> dict[str, Any]:
+        return {**self._motors_ft, **self._cameras_ft}
+
+    @property
+    def cameras(self):
+        return self._cameras
+
+    @cameras.setter
+    def cameras(self, value):
+        self._cameras = value
+
+    @property
+    def config(self):
+        return self._config
+
+    @config.setter
+    def config(self, value):
+        self._config = value

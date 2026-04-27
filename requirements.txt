@@ -1,0 +1,11 @@
+# Install the subpackages in editable mode
+# UR Robot packages
+-e ./lerobot_robot_ur
+-e ./lerobot_teleoperator_vr
+
+# ARX LIFT packages
+-e ./lerobot_robot_arx
+-e ./lerobot_teleoperator_arx
+
+# Install the main project in editable mode
+-e .
