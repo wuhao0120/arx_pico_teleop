@@ -18,13 +18,12 @@ import sys
 import time
 import numpy as np
 
-# Add XRoboToolkit path (in lerobot_data_collection directory)
+# Add XRoboToolkit path (bundled inside pico_teleop)
 import os
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 _scripts_dir = os.path.dirname(_script_dir)
 _project_root = os.path.dirname(_scripts_dir)
-_lerobot_data_root = os.path.dirname(_project_root)
-_xr_toolkit_path = os.path.join(_lerobot_data_root, "xrobotoolkit_teleop")
+_xr_toolkit_path = os.path.join(_project_root, "xrobotoolkit_teleop")
 sys.path.insert(0, _xr_toolkit_path)
 
 np.set_printoptions(suppress=True, precision=3)

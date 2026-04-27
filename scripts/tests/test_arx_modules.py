@@ -179,7 +179,7 @@ def test_teleop_import():
 
     try:
         # Add paths for the packages
-        base_path = "/home/arx/ARX_new/lerobot_data_collection/arx_vr_data_collection"
+        base_path = str(Path(__file__).resolve().parent.parent.parent)
         sys.path.insert(0, base_path)
 
         from teleoperators.arx import ARXVRTeleop, ARXVRTeleopConfig

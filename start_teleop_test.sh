@@ -22,8 +22,8 @@ NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
-ARX_WORKSPACE="/home/arx/ARX_new"
-ARX_ROS2_WS="$ARX_WORKSPACE/ros2_ws"
+ARX_WORKSPACE="${ARX_WORKSPACE:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+ARX_ROS2_WS="${ARX_ROS2_WS:-$ARX_WORKSPACE/ros2_ws}"
 RPC_BRIDGE_DIR="$PROJECT_ROOT/ros2_bridge"
 
 LOG_DIR="$PROJECT_ROOT/.log"

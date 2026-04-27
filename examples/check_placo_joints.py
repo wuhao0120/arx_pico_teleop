@@ -5,8 +5,12 @@
 import sys
 from pathlib import Path
 
-# Add project paths
-sys.path.insert(0, "/home/arx/ARX_new/lerobot_data_collection/arx_vr_data_collection")
+# Add project root (data_collection/pico_teleop) to path
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
+
+# robot_description is two levels up from pico_teleop (at ARX_new root)
+_ARX_ROOT = _PROJECT_ROOT.parent.parent
 
 import placo
 import numpy as np
@@ -14,7 +18,7 @@ import numpy as np
 
 def main():
     # Load URDF
-    urdf_path = Path("/home/arx/ARX_new/robot_description/lift.urdf")
+    urdf_path = _ARX_ROOT / "robot_description" / "lift.urdf"
 
     print(f"Loading URDF from: {urdf_path}")
     print(f"URDF exists: {urdf_path.exists()}")

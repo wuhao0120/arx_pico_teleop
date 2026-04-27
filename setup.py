@@ -3,11 +3,16 @@ from pathlib import Path
 # ====== Project root ======
 ROOT = Path(__file__).parent.resolve()
 setup(
-    name="lerobot_ur_dual_vrteleop",
+    name="arx_pico_teleop",
     version="0.1.0",
-    description="Dual UR teleoperation and dataset collection utilities with VR support",
+    description="Pico 4 VR teleoperation and dataset collection for ARX robots",
     python_requires=">=3.10",
-    packages=find_packages(where=".", include=["scripts", "scripts.*", "robots", "robots.*", "teleoperators", "teleoperators.*"]),
+    packages=find_packages(where=".", include=[
+        "scripts", "scripts.*",
+        "robots", "robots.*",
+        "teleoperators", "teleoperators.*",
+        "xrobotoolkit_teleop", "xrobotoolkit_teleop.*",
+    ]),
     include_package_data=True,
     install_requires=[
     "send2trash",
