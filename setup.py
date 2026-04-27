@@ -25,10 +25,10 @@ setup(
     entry_points={
         "console_scripts": [
             # === 主要命令 (pico 遥操) ===
-            "robot-record = scripts.launcher:launch_remote_recording",  # Client 端: 远程 RPC 数采(record 模式)
-            "robot-replay = scripts.launcher:launch_remote_replay",      # Client 端: 远程 RPC 回放
-            "robot-reset = scripts.launcher:launch_robot_reset",          # Client 端: 移动双臂到初始位置
-            "robot-rpc = scripts.launcher:launch_rpc_server",            # Server 端: 启动 RPC server
+            "pico-record = scripts.launcher:launch_remote_recording",  # Client 端: 远程 RPC 数采(record 模式)
+            "pico-replay = scripts.launcher:launch_remote_replay",      # Client 端: 远程 RPC 回放
+            "pico-reset = scripts.launcher:launch_robot_reset",          # Client 端: 移动双臂到初始位置
+            "pico-rpc = scripts.launcher:launch_rpc_server",            # Server 端: 启动 RPC server
 
             # === 原有 UR 命令 (保留兼容) ===
             "vr-record = scripts.core.run_record:main",
