@@ -29,6 +29,9 @@ setup(
             "pico-reset = scripts.launcher:launch_robot_reset",
             "pico-rpc = scripts.launcher:launch_rpc_server",
 
+            # === 通用别名 ===
+            "robot-reset = scripts.launcher:launch_robot_reset",
+
             # === 工具 ===
             "tools-check-dataset = scripts.tools.check_dataset_info:main",
             "tools-check-rs = scripts.tools.rs_devices:main",
