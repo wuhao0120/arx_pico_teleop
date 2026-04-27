@@ -24,16 +24,10 @@ setup(
     entry_points={
         "console_scripts": [
             # === 主要命令 (pico 遥操) ===
-            "pico-record = scripts.launcher:launch_remote_recording",  # Client 端: 远程 RPC 数采(record 模式)
-            "pico-replay = scripts.launcher:launch_remote_replay",      # Client 端: 远程 RPC 回放
-            "pico-reset = scripts.launcher:launch_robot_reset",          # Client 端: 移动双臂到初始位置
-            "pico-rpc = scripts.launcher:launch_rpc_server",            # Server 端: 启动 RPC server
-
-            # === 原有 UR 命令 (保留兼容) ===
-            "vr-record = scripts.core.run_record:main",
-            "vr-replay = scripts.core.run_replay:main",
-            "vr-visualize = scripts.core.run_visualize:main",
-            "arx-record = scripts.core.run_record_arx:main",
+            "pico-record = scripts.launcher:launch_remote_recording",
+            "pico-replay = scripts.launcher:launch_remote_replay",
+            "pico-reset = scripts.launcher:launch_robot_reset",
+            "pico-rpc = scripts.launcher:launch_rpc_server",
 
             # === 工具 ===
             "tools-check-dataset = scripts.tools.check_dataset_info:main",
@@ -41,7 +35,6 @@ setup(
 
             # === 测试 ===
             "test-gripper-ctrl = scripts.tests.gripper_ctrl:main",
-            "test-ur-freedrive = scripts.tests.ur_freedrive:main",
             "test-arx-connection = scripts.tests.test_arx_modules:main",
 
             # === 帮助 ===
