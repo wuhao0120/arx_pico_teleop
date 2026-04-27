@@ -253,9 +253,10 @@ class ARXLift(Robot):
                 new_left  = (left_ee  + left_delta).tolist()
                 new_right = (right_ee + right_delta).tolist()
 
-                # 二值夹爪指令 (0.0=开, 1.0=关)
-                left_gripper  = float(action.get("left_gripper_cmd_bin",  0.0))
-                right_gripper = float(action.get("right_gripper_cmd_bin", 0.0))
+                # 二值夹爪指令: 训练值为 0/1，但模型输出可能超出范围，阈值化到 0/1
+                # > 0.5 → 1.0（关）；<= 0.5 → 0.0（开）
+                left_gripper  = 1.0 if action.get("left_gripper_cmd_bin",  0.0) > 0.5 else 0.0
+                right_gripper = 1.0 if action.get("right_gripper_cmd_bin", 0.0) > 0.5 else 0.0
 
                 self.bridge.set_dual_ee_poses(new_left, new_right, left_gripper, right_gripper)
 
