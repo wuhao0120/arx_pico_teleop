@@ -20,7 +20,6 @@ setup(
     ],
     scripts=[
         "scripts/tools/map_gripper.sh",
-        "scripts/tools/arx-record.sh",
     ],
     entry_points={
         "console_scripts": [
