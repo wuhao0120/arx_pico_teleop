@@ -202,6 +202,22 @@ for MOD in zerorpc gevent; do
     fi
 done
 
+# ---------- 清理残留进程 ----------
+_stale=$(pgrep -f "run_record_arx.py" 2>/dev/null || true)
+if [ -n "$_stale" ]; then
+    log_warn "发现残留 run_record_arx.py 进程 (PID: $_stale)，自动清理..."
+    kill $_stale 2>/dev/null || true
+    # 等待内核释放 /dev/video* 设备，最多 10s
+    for _i in $(seq 1 10); do
+        sleep 1
+        if ! lsof /dev/video* 2>/dev/null | grep -q "python"; then
+            break
+        fi
+        log_warn "等待设备释放... (${_i}s)"
+    done
+    log_ok "残留进程已清理"
+fi
+
 # ---------- 启动（当前终端前台，同时写入日志）----------
 log_info "启动 run_record_arx.py（ARX_RPC_HOST / ARX_RPC_PORT 将传入子进程）..."
 

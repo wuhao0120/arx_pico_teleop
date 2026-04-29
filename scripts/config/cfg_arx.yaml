@@ -2,7 +2,7 @@ record:
   repo_id: &repo_id "deepcybo/r5_dual_arm_task/clean_up_table"
   debug: &debug False  # if True, robot will not execute any actions
   user_notes:
-  fps: 15
+  fps: 30
 
   robot:
     left_can: &left_can "can1"
@@ -30,9 +30,21 @@ record:
     scale_factor: 0.8
     R_headset_world: [-90, 0, 90]  # ZYX Euler angles in degrees
     # 双臂安装朝向补偿: 绕 Z 轴的 yaw 角 (度)
-    # 两臂相对安装时: 左臂顺时针 +90, 右臂逆时针 -90; 两臂同向时: 均为 0
-    left_arm_yaw_comp_deg: 90
-    right_arm_yaw_comp_deg: -90
+    #
+    # 作用: 在将 VR 控制器 delta 送入 Placo IK 之前, 对 delta_xyz / delta_rot
+    #       施加一个绕 Z 轴的旋转, 以补偿物理安装朝向与 URDF 坐标系的差异.
+    #       URDF (dual_R5a.urdf) 中两臂 base joint 的 rpy 均为 "0 0 0",
+    #       即 URDF 本身建模为平行安装; yaw_comp 仅用于弥补物理姿态差异.
+    #
+    # 平行安装 (两臂朝向相同, 当前配置):
+    #   物理安装与 URDF 一致, 无需补偿, 两值均置 0
+    #   comp = R(z, 0) = 单位旋转, 对 delta 无影响
+    left_arm_yaw_comp_deg: 0    # 平行安装: 无补偿
+    right_arm_yaw_comp_deg: 0   # 平行安装: 无补偿
+    #
+    # 相对安装 (两臂面对面, 若需切回请改为以下值):
+    #   left_arm_yaw_comp_deg: 90    # 左臂绕 Z 顺时针 +90°
+    #   right_arm_yaw_comp_deg: -90  # 右臂绕 Z 逆时针 -90°
 
     placo:
       robot_urdf_path: "assets/r5_urdf/dual_R5a.urdf"
@@ -81,8 +93,8 @@ record:
     left_wrist_cam_serial: "218622278394"
     right_wrist_cam_serial: "218622274803"
     exterior_cam_serial: "218622271302"
-    width: 424
-    height: 240
+    width: 640
+    height: 480
 
   storage:
     push_to_hub: False
