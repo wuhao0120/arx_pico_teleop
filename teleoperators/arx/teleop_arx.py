@@ -31,6 +31,7 @@ from scipy.spatial.transform import Rotation as R
 
 from lerobot.teleoperators.teleoperator import Teleoperator
 from .config_teleop_arx import ARXVRTeleopConfig
+from .filters import JointRateLimiter, OneEuroFilter, SlerpEMA
 from xrobotoolkit_teleop.common.xr_client import XrClient
 from xrobotoolkit_teleop.hardware.interface.universal_robots import CONTROLLER_DEADZONE
 from xrobotoolkit_teleop.utils.geometry import apply_delta_pose, quat_diff_as_angle_axis
@@ -123,8 +124,6 @@ class ARXVRTeleop(Teleoperator):
         self.init_ee_quat = {"left_arm": None, "right_arm": None}
         self.init_controller_xyz = {"left_arm": None, "right_arm": None}
         self.init_controller_quat = {"left_arm": None, "right_arm": None}
-        self.filtered_delta_xyz = {"left_arm": None, "right_arm": None}
-        self.filtered_delta_rot = {"left_arm": None, "right_arm": None}
 
         # Target joint positions
         self.target_left_q = np.zeros(self._num_joints)
@@ -158,34 +157,35 @@ class ARXVRTeleop(Teleoperator):
         self._left_arm_comp = R.from_euler("z", self.cfg.left_arm_yaw_comp_deg, degrees=True)
         self._right_arm_comp = R.from_euler("z", self.cfg.right_arm_yaw_comp_deg, degrees=True)
 
-    @staticmethod
-    def _clamp_alpha(alpha: float) -> float:
-        return float(np.clip(alpha, 0.0, 1.0))
+        # Smoothing filters (see filters.py for tuning notes).
+        # Pose filter: 3 OneEuro per arm for xyz, 1 SlerpEMA per arm for quat.
+        self._pose_xyz_filter = {
+            arm: [
+                OneEuroFilter(
+                    min_cutoff=self.cfg.pose_min_cutoff,
+                    beta=self.cfg.pose_beta,
+                    d_cutoff=self.cfg.pose_d_cutoff,
+                )
+                for _ in range(3)
+            ]
+            for arm in self.manipulator_config
+        }
+        self._pose_quat_filter = {arm: SlerpEMA() for arm in self.manipulator_config}
 
-    def _apply_ema(self, prev: np.ndarray | None, current: np.ndarray, alpha: float) -> np.ndarray:
-        """Apply first-order low-pass smoothing to a vector."""
-        alpha = self._clamp_alpha(alpha)
-        if prev is None or alpha >= 1.0:
-            return current.copy()
-        if alpha <= 0.0:
-            return prev.copy()
-        return prev + alpha * (current - prev)
-
-    def _filter_arm_delta(self, arm_name: str, delta_xyz: np.ndarray, delta_rot: np.ndarray):
-        """Low-pass filter VR delta pose before IK to suppress hand jitter."""
-        filtered_xyz = self._apply_ema(
-            self.filtered_delta_xyz[arm_name],
-            delta_xyz,
-            self.cfg.position_filter_alpha,
+        # Joint rate limiter: 6 arm joints per arm; dt from teleop fps.
+        _dt = 1.0 / max(int(self.cfg.fps), 1)
+        self._joint_limiter_left = JointRateLimiter(
+            dim=self._num_arm_joints,
+            alpha=self.cfg.joint_ema_alpha,
+            max_velocity=self.cfg.joint_max_velocity,
+            dt=_dt,
         )
-        filtered_rot = self._apply_ema(
-            self.filtered_delta_rot[arm_name],
-            delta_rot,
-            self.cfg.rotation_filter_alpha,
+        self._joint_limiter_right = JointRateLimiter(
+            dim=self._num_arm_joints,
+            alpha=self.cfg.joint_ema_alpha,
+            max_velocity=self.cfg.joint_max_velocity,
+            dt=_dt,
         )
-        self.filtered_delta_xyz[arm_name] = filtered_xyz
-        self.filtered_delta_rot[arm_name] = filtered_rot
-        return filtered_xyz, filtered_rot
 
     @property
     def action_features(self) -> dict:
@@ -367,6 +367,11 @@ class ARXVRTeleop(Teleoperator):
         self.target_left_q = np.array(left_pos)   # 7 values (6 arm + 1 gripper)
         self.target_right_q = np.array(right_pos)
 
+        # Seed joint rate limiters with current state so the first commanded
+        # frame doesn't get clamped/lagged from a zero initial value.
+        self._joint_limiter_left.reset(self.target_left_q[:self._num_arm_joints])
+        self._joint_limiter_right.reset(self.target_right_q[:self._num_arm_joints])
+
         # Set initial IK targets to current EE poses
         for name, config in self.manipulator_config.items():
             T_current = self.placo_robot.get_T_world_frame(config["link_name"])
@@ -454,6 +459,12 @@ class ARXVRTeleop(Teleoperator):
             self.placo_robot.update_kinematics()
             left_solved, right_solved = self._read_placo_arm_joints()
 
+            # Joint-space smoothing (EMA + per-joint velocity clamp) to
+            # absorb single-frame IK jumps before commanding the robot.
+            if self.cfg.enable_joint_filter:
+                left_solved = self._joint_limiter_left.step(left_solved)
+                right_solved = self._joint_limiter_right.step(right_solved)
+
             # Update arm joints (indices 0-5), keep gripper at index 6
             self.target_left_q[:6] = left_solved
             self.target_right_q[:6] = right_solved
@@ -505,7 +516,6 @@ class ARXVRTeleop(Teleoperator):
             comp = self._left_arm_comp if arm_name == "left_arm" else self._right_arm_comp
             delta_xyz = comp.apply(delta_xyz)
             delta_rot = comp.apply(delta_rot)
-            delta_xyz, delta_rot = self._filter_arm_delta(arm_name, delta_xyz, delta_rot)
 
             # Apply delta to get target EE pose
             target_xyz, target_quat = apply_delta_pose(
@@ -527,8 +537,6 @@ class ARXVRTeleop(Teleoperator):
                 self.init_ee_quat[arm_name] = None
                 self.init_controller_xyz[arm_name] = None
                 self.init_controller_quat[arm_name] = None
-                self.filtered_delta_xyz[arm_name] = None
-                self.filtered_delta_rot[arm_name] = None
                 logger.info(f"[{arm_name}] 退出IK控制，保持当前位置")
                 # Hold current pose as IK target
                 T_current = self.placo_robot.get_T_world_frame(config["link_name"])
@@ -572,6 +580,26 @@ class ARXVRTeleop(Teleoperator):
             tf.quaternion_multiply(R_quat, controller_quat),
             tf.quaternion_conjugate(R_quat),
         )
+
+        # Pose smoothing: One-Euro on xyz, slerp-EMA on quat. Reset filters
+        # on activation so the init pose matches the smoothed stream and
+        # there's no cold-start step.
+        if self.cfg.enable_pose_filter:
+            xyz_filters = self._pose_xyz_filter[arm_name]
+            quat_filter = self._pose_quat_filter[arm_name]
+            if self.init_controller_xyz[arm_name] is None:
+                t_now = time.perf_counter()
+                for i, f in enumerate(xyz_filters):
+                    f.reset(float(controller_xyz[i]), t_now)
+                quat_filter.reset(controller_quat)
+            else:
+                t_now = time.perf_counter()
+                controller_xyz = np.array(
+                    [xyz_filters[i](float(controller_xyz[i]), t_now) for i in range(3)]
+                )
+                controller_quat = quat_filter.step(
+                    controller_quat, self.cfg.quat_slerp_alpha
+                )
 
         if self.init_controller_xyz[arm_name] is None:
             self.init_controller_xyz[arm_name] = controller_xyz.copy()
@@ -642,8 +670,11 @@ class ARXVRTeleop(Teleoperator):
             self.init_ee_quat[arm_name] = None
             self.init_controller_xyz[arm_name] = None
             self.init_controller_quat[arm_name] = None
-            self.filtered_delta_xyz[arm_name] = None
-            self.filtered_delta_rot[arm_name] = None
+            # Pose filters get re-seeded on next activation; clearing here
+            # avoids stale state if config flags get toggled at runtime.
+            for f in self._pose_xyz_filter[arm_name]:
+                f.reset()
+            self._pose_quat_filter[arm_name].reset()
 
         # Reset delta tcp_pose tracking
         self._prev_left_tcp_pose = np.zeros(6)
@@ -651,9 +682,7 @@ class ARXVRTeleop(Teleoperator):
         self._tcp_pose_initialized = False
 
         # 同步目标关节到当前机器人位置，防止新 episode 第一帧跳变
-        self._init_qpos()
-
-        # 同步目标关节到当前机器人位置，防止新 episode 第一帧跳变
+        # (also re-seeds joint rate limiters to current state)
         self._init_qpos()
 
     def calibrate(self) -> None:

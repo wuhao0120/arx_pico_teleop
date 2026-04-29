@@ -28,10 +28,6 @@ record:
   teleop:
     control_mode: "vrteleop"
     scale_factor: 0.8
-    # VR 遥操低通滤波: 越小越稳，延迟也越明显；1.0 代表关闭滤波
-    filter:
-      position_alpha: 0.55
-      rotation_alpha: 0.55
     R_headset_world: [-90, 0, 90]  # ZYX Euler angles in degrees
     # 双臂安装朝向补偿: 绕 Z 轴的 yaw 角 (度)
     # 两臂相对安装时: 左臂顺时针 +90, 右臂逆时针 -90; 两臂同向时: 均为 0
@@ -56,6 +52,19 @@ record:
       trigger_threshold: 0.5
       close_position: *gripper_close
       open_position: *gripper_open
+
+    # 遥操平滑滤波 (缓解 VR 抖动 / IK 单帧跳变)
+    # pose_*: VR 原始位姿 One-Euro + slerp EMA; 调小 min_cutoff / quat_slerp_alpha => 更平滑
+    # joint_*: IK 解算后关节命令 EMA + 速度限制; 调小 joint_ema_alpha => 更平滑
+    smoothing:
+      enable_pose_filter: true
+      pose_min_cutoff: 0.8      # Hz, 越小越平滑
+      pose_beta: 0.08           # 越大快速运动延迟越小
+      pose_d_cutoff: 1.0
+      quat_slerp_alpha: 0.5     # [0,1], 1.0=不平滑
+      enable_joint_filter: true
+      joint_ema_alpha: 0.6      # [0,1], 1.0=不平滑
+      joint_max_velocity: 3.0   # rad/s, <=0 关闭限速
 
   task:
     description: "Use left arm to open the box and put the baby cup into box by right arm."

@@ -23,11 +23,6 @@ class ARXVRTeleopConfig(TeleoperatorConfig):
     # VR control scaling
     scale_factor: float = 0.8
 
-    # Low-pass smoothing for VR delta pose.
-    # 1.0 = no smoothing; lower values = smoother but more lag.
-    position_filter_alpha: float = 1.0
-    rotation_filter_alpha: float = 1.0
-
     # Coordinate transformation (ZYX Euler angles in degrees)
     R_headset_world: list = None
 
@@ -59,6 +54,21 @@ class ARXVRTeleopConfig(TeleoperatorConfig):
 
     # Control mode
     control_mode: str = "vrteleop"
+
+    # ---------------- Smoothing filters ----------------
+    # VR pose-level smoothing (One-Euro on xyz, slerp-EMA on quat).
+    # Applied on the raw VR controller pose BEFORE delta computation.
+    enable_pose_filter: bool = True
+    pose_min_cutoff: float = 1.0   # Hz, lower => more smoothing at low speeds
+    pose_beta: float = 0.02        # higher => less lag at high speeds
+    pose_d_cutoff: float = 1.0     # Hz, derivative low-pass cutoff
+    quat_slerp_alpha: float = 0.5  # in [0, 1]; 1.0 disables quat smoothing
+
+    # Joint-command smoothing (EMA + per-joint velocity clamp).
+    # Applied on IK-solved joint angles BEFORE writing to target_*_q.
+    enable_joint_filter: bool = True
+    joint_ema_alpha: float = 0.6      # in [0, 1]; 1.0 disables EMA
+    joint_max_velocity: float = 3.0   # rad/s; <= 0 disables velocity clamp
 
     def __post_init__(self):
         if self.R_headset_world is None:

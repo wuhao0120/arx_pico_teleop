@@ -74,14 +74,11 @@ class ARXRecordConfig:
         teleop_chassis = teleop["chassis"]
         teleop_gripper = teleop["gripper"]
         teleop_placo = teleop["placo"]
-        teleop_filter = teleop.get("filter", {})
         self.scale_factor: float = teleop["scale_factor"]
         self.control_mode: str = teleop.get("control_mode", "vrteleop")
         self.R_headset_world: list = teleop["R_headset_world"]
         self.left_arm_yaw_comp_deg: float = teleop.get("left_arm_yaw_comp_deg", 0.0)
         self.right_arm_yaw_comp_deg: float = teleop.get("right_arm_yaw_comp_deg", 0.0)
-        self.position_filter_alpha: float = teleop_filter.get("position_alpha", 1.0)
-        self.rotation_filter_alpha: float = teleop_filter.get("rotation_alpha", 1.0)
         self.trigger_reverse: bool = teleop_gripper["trigger_reverse"]
         self.trigger_threshold: float = teleop_gripper["trigger_threshold"]
         self.teleop_close_position: float = teleop_gripper["close_position"]
@@ -94,6 +91,17 @@ class ARXRecordConfig:
         self.robot_urdf_path: str = teleop_placo["robot_urdf_path"]
         self.servo_time: float = teleop_placo["servo_time"]
         self.visualize_placo: bool = teleop_placo["visualize_placo"]
+
+        # Smoothing config (optional; defaults match ARXVRTeleopConfig).
+        smoothing = teleop.get("smoothing", {})
+        self.enable_pose_filter: bool = smoothing.get("enable_pose_filter", True)
+        self.pose_min_cutoff: float = smoothing.get("pose_min_cutoff", 1.0)
+        self.pose_beta: float = smoothing.get("pose_beta", 0.02)
+        self.pose_d_cutoff: float = smoothing.get("pose_d_cutoff", 1.0)
+        self.quat_slerp_alpha: float = smoothing.get("quat_slerp_alpha", 0.5)
+        self.enable_joint_filter: bool = smoothing.get("enable_joint_filter", True)
+        self.joint_ema_alpha: float = smoothing.get("joint_ema_alpha", 0.6)
+        self.joint_max_velocity: float = smoothing.get("joint_max_velocity", 3.0)
 
         # Task config
         self.num_episodes: int = task.get("num_episodes", 1)
@@ -540,8 +548,6 @@ def run_record(record_cfg: ARXRecordConfig):
             xr_client=xr_client,
             fps=record_cfg.fps,
             scale_factor=record_cfg.scale_factor,
-            position_filter_alpha=record_cfg.position_filter_alpha,
-            rotation_filter_alpha=record_cfg.rotation_filter_alpha,
             R_headset_world=record_cfg.R_headset_world,
             left_arm_yaw_comp_deg=record_cfg.left_arm_yaw_comp_deg,
             right_arm_yaw_comp_deg=record_cfg.right_arm_yaw_comp_deg,
@@ -558,7 +564,15 @@ def run_record(record_cfg: ARXRecordConfig):
             control_mode=record_cfg.control_mode,
             robot_urdf_path=record_cfg.robot_urdf_path,
             servo_time=record_cfg.servo_time,
-            visualize_placo=record_cfg.visualize_placo
+            visualize_placo=record_cfg.visualize_placo,
+            enable_pose_filter=record_cfg.enable_pose_filter,
+            pose_min_cutoff=record_cfg.pose_min_cutoff,
+            pose_beta=record_cfg.pose_beta,
+            pose_d_cutoff=record_cfg.pose_d_cutoff,
+            quat_slerp_alpha=record_cfg.quat_slerp_alpha,
+            enable_joint_filter=record_cfg.enable_joint_filter,
+            joint_ema_alpha=record_cfg.joint_ema_alpha,
+            joint_max_velocity=record_cfg.joint_max_velocity,
         )
         teleop = ARXVRTeleop(teleop_config)
 
