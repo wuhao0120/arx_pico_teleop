@@ -40,8 +40,7 @@ DATACOL_LOG="$LOG_DIR/data_collection_remote_${TIMESTAMP}.log"
 # 让动态链接器能找到 libPXREARobotSDK.so（可用 XR_SDK_LIB_DIR 覆盖）。
 if [ -z "${XR_SDK_LIB_DIR:-}" ]; then
     for _candidate in \
-        "$PROJECT_ROOT/../XRoboToolkit-Teleop-Sample-Python/dependencies/XRoboToolkit-PC-Service-Pybind/lib" \
-        "/home/wuhao/workspace/ur_data/lerobot/XRoboToolkit-Teleop-Sample-Python/dependencies/XRoboToolkit-PC-Service-Pybind/lib" \
+        "$PROJECT_ROOT/xrobotoolkit_teleop/dependencies/XRoboToolkit-PC-Service-Pybind/lib" \
         "/opt/apps/roboticsservice/SDK/x64"; do
         if [ -f "$_candidate/libPXREARobotSDK.so" ]; then
             XR_SDK_LIB_DIR="$(cd "$_candidate" && pwd)"

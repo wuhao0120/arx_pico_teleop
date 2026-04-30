@@ -1,5 +1,5 @@
 record:
-  repo_id: &repo_id "deepcybo/r5_dual_arm_task/clean_up_table"
+  repo_id: &repo_id "deepcybo/r5_dual_arm_task/bottle_handoff"
   debug: &debug False  # if True, robot will not execute any actions
   user_notes:
   fps: 30
@@ -90,8 +90,8 @@ record:
     save_meta_period: 1
 
   cameras:
-    left_wrist_cam_serial: "218622278394"
-    right_wrist_cam_serial: "218622274803"
+    left_wrist_cam_serial: "218622274803"
+    right_wrist_cam_serial: "218622278394"
     exterior_cam_serial: "218622271302"
     width: 640
     height: 480
